@@ -20,6 +20,19 @@ exports.getUserTasks = async (req, res) => {
   }
 };
 
+exports.getTaskById = async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id).populate('createdBy assignedTo', 'name email');
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+    res.json(task);
+  } catch (err) {
+    res.status(400).json({ message: 'Error fetching task', error: err.message });
+  }
+};
+
+
 exports.updateTask = async (req, res) => {
   try {
     const task = await Task.findByIdAndUpdate(req.params.id, req.body, { new: true });
