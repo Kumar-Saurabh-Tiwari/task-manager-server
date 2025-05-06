@@ -6,11 +6,14 @@ const {
   updateTask,
   deleteTask,
   getTaskById,
+  searchTasks,
 } = require('../controllers/taskController');
 
 const router = express.Router();
 
 router.use(auth);
+
+router.get('/search',searchTasks);
 
 router.post('/', createTask);
 router.get('/', getUserTasks);

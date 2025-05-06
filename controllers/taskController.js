@@ -50,3 +50,50 @@ exports.deleteTask = async (req, res) => {
     res.status(400).json({ message: 'Error deleting task', error: err.message });
   }
 };
+
+// controllers/taskController.js
+exports.searchTasks = async (req, res) => {
+  try {
+    const { q, status, priority, dueDate } = req.query;
+    const query = {
+      $and: [
+        {
+          $or: [
+            { createdBy: req.userId },
+            { assignedTo: req.userId }
+          ]
+        }
+      ]
+    };
+
+    if (q) {
+      query.$and.push({
+        $or: [
+          { title: { $regex: q, $options: 'i' } },
+          { description: { $regex: q, $options: 'i' } }
+        ]
+      });
+    }
+
+    if (status) {
+      query.$and.push({ status });
+    }
+
+    if (priority) {
+      query.$and.push({ priority });
+    }
+
+    if (dueDate) {
+      const start = new Date(dueDate);
+      const end = new Date(dueDate);
+      end.setHours(23, 59, 59, 999);
+      query.$and.push({ dueDate: { $gte: start, $lte: end } });
+    }
+
+    const tasks = await Task.find(query).populate('createdBy assignedTo', 'name email');
+    res.json(tasks);
+  } catch (err) {
+    res.status(500).json({ message: 'Error searching tasks', error: err.message });
+  }
+};
+
