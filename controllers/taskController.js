@@ -1,14 +1,18 @@
 const Task = require('../models/Task');
+const { getIO } = require('../socket');
 
 exports.createTask = async (req, res) => {
   try {
     const task = await Task.create({ ...req.body, createdBy: req.userId });
+
+    const io = getIO();
+    io.emit('receive-task-update', task);
+
     res.status(201).json(task);
   } catch (err) {
     res.status(400).json({ message: 'Error creating task', error: err.message });
   }
 };
-
 exports.getUserTasks = async (req, res) => {
   try {
     const tasks = await Task.find({
