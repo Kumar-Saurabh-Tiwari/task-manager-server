@@ -165,7 +165,7 @@ exports.searchFlights = async (req, res) => {
 
 // 3. Get flight route between two airports (DEL to BOM example)
 exports.getFlightRoute = async (req, res) => {
-  const { from, to, hours = 12, showAll = false } = req.query;
+  const { from, to, hours = 12, showAll = false, date } = req.query;
 
   if (!from || !to) {
     return res.status(400).json({ 
@@ -174,11 +174,103 @@ exports.getFlightRoute = async (req, res) => {
   }
 
   const searchHours = parseInt(hours);
-  const now = Math.floor(Date.now() / 1000);
-  const startTime = now - (searchHours * 3600);
 
   try {
-    // Convert IATA to ICAO if needed (OpenSky uses ICAO codes)
+    // First, try AviationStack API for comprehensive flight data
+    if (AVIATIONSTACK_API_KEY && AVIATIONSTACK_API_KEY !== 'YOUR_AVIATIONSTACK_API_KEY') {
+      try {
+        // Get flight schedules from AviationStack
+        const flightResponse = await axios.get(`${AVIATIONSTACK_BASE_URL}/flights`, {
+          params: {
+            access_key: AVIATIONSTACK_API_KEY,
+            dep_iata: from,
+            arr_iata: to,
+            limit: 50
+          },
+          timeout: 15000
+        });
+
+        console.log('AviationStack Flight Response:', {
+          status: flightResponse.status,
+          dataLength: flightResponse.data?.data?.length || 0,
+          pagination: flightResponse.data?.pagination
+        });
+
+        if (flightResponse.data?.data && flightResponse.data.data.length > 0) {
+          const flights = flightResponse.data.data.map(flight => ({
+            flightNumber: flight.flight?.iata || flight.flight?.icao || 'Unknown',
+            callsign: flight.flight?.icao,
+            airline: {
+              name: flight.airline?.name,
+              iata: flight.airline?.iata,
+              icao: flight.airline?.icao
+            },
+            from: {
+              airport: flight.departure?.airport,
+              iata: flight.departure?.iata,
+              icao: flight.departure?.icao,
+              terminal: flight.departure?.terminal,
+              gate: flight.departure?.gate,
+              scheduled: flight.departure?.scheduled,
+              estimated: flight.departure?.estimated,
+              actual: flight.departure?.actual,
+              timezone: flight.departure?.timezone
+            },
+            to: {
+              airport: flight.arrival?.airport,
+              iata: flight.arrival?.iata,
+              icao: flight.arrival?.icao,
+              terminal: flight.arrival?.terminal,
+              gate: flight.arrival?.gate,
+              scheduled: flight.arrival?.scheduled,
+              estimated: flight.arrival?.estimated,
+              actual: flight.arrival?.actual,
+              timezone: flight.arrival?.timezone
+            },
+            aircraft: {
+              registration: flight.aircraft?.registration,
+              iata: flight.aircraft?.iata,
+              icao: flight.aircraft?.icao
+            },
+            status: flight.flight_status,
+            duration: this.calculateDuration(flight.departure?.scheduled, flight.arrival?.scheduled),
+            // Mock pricing (AviationStack free tier doesn't include pricing)
+            pricing: {
+              economy: {
+                price: Math.floor(Math.random() * (15000 - 3000) + 3000), // ₹3000-15000
+                currency: 'INR',
+                availability: Math.floor(Math.random() * 50) + 1
+              },
+              business: {
+                price: Math.floor(Math.random() * (45000 - 18000) + 18000), // ₹18000-45000
+                currency: 'INR',
+                availability: Math.floor(Math.random() * 10) + 1
+              }
+            }
+          }));
+
+          return res.json({
+            success: true,
+            route: `${from} → ${to}`,
+            count: flights.length,
+            data: flights,
+            meta: {
+              source: 'aviationstack',
+              searchHours: searchHours,
+              timestamp: new Date().toISOString(),
+              pagination: flightResponse.data.pagination
+            }
+          });
+        }
+      } catch (aviationError) {
+        console.error('AviationStack error:', aviationError.response?.data || aviationError.message);
+      }
+    }
+
+    // Fallback to OpenSky with timeout handling
+    const now = Math.floor(Date.now() / 1000);
+    const startTime = now - (searchHours * 3600);
+
     const iataToIcaoMap = {
       'DEL': 'VIDP', 'BOM': 'VABB', 'JFK': 'KJFK', 'LAX': 'KLAX', 
       'LHR': 'EGLL', 'CDG': 'LFPG', 'DXB': 'OMDB', 'SIN': 'WSSS',
@@ -188,168 +280,180 @@ exports.getFlightRoute = async (req, res) => {
     const fromICAO = iataToIcaoMap[from] || from;
     const toICAO = iataToIcaoMap[to] || to;
 
-    // Get departures from origin airport
-    const departuresResponse = await axios.get(`${OPENSKY_BASE_URL}/flights/departure`, {
-      params: {
-        airport: fromICAO,
-        begin: startTime,
-        end: now
-      },
-      timeout: 10000 // 10 second timeout
-    });
-
-    console.log('OpenSky API Response:', {
-      status: departuresResponse.status,
-      dataLength: departuresResponse.data ? departuresResponse.data.length : 0,
-      data: departuresResponse.data
-    });
-
-    // Check if we got valid data
-    if (!departuresResponse.data || departuresResponse.data.length === 0) {
-      // Fallback: Try with different time ranges
-      const yesterday = now - (24 * 3600);
-      const fallbackResponse = await axios.get(`${OPENSKY_BASE_URL}/flights/departure`, {
+    try {
+      const departuresResponse = await axios.get(`${OPENSKY_BASE_URL}/flights/departure`, {
         params: {
           airport: fromICAO,
-          begin: yesterday,
+          begin: startTime,
           end: now
         },
-        timeout: 10000
+        timeout: 8000 // Reduced timeout
       });
 
-      if (!fallbackResponse.data || fallbackResponse.data.length === 0) {
-        return res.json({
-          success: true,
-          route: `${from} → ${to}`,
-          count: 0,
-          data: [],
-          message: 'No flight data available for this route in the specified time range',
-          suggestions: [
-            'Try increasing the hours parameter (e.g., hours=24 or hours=48)',
-            'This route might not have regular flights',
-            'OpenSky Network has limited historical data'
-          ],
-          meta: {
-            source: 'opensky-network',
-            searchHours: searchHours,
-            fromICAO: fromICAO,
-            toICAO: toICAO,
-            timestamp: new Date().toISOString()
+      if (departuresResponse.data && departuresResponse.data.length > 0) {
+        const allFlights = departuresResponse.data.map(flight => ({
+          icao24: flight.icao24,
+          callsign: flight.callsign?.trim() || 'Unknown',
+          from: flight.estDepartureAirport || fromICAO,
+          to: flight.estArrivalAirport || 'Unknown',
+          departureTime: flight.firstSeen ? new Date(flight.firstSeen * 1000).toISOString() : null,
+          arrivalTime: flight.lastSeen ? new Date(flight.lastSeen * 1000).toISOString() : null,
+          duration: flight.firstSeen && flight.lastSeen ? 
+            Math.round((flight.lastSeen - flight.firstSeen) / 60) + ' minutes' : 'Unknown',
+          // Add mock pricing to OpenSky data
+          pricing: {
+            economy: {
+              price: Math.floor(Math.random() * (12000 - 4000) + 4000),
+              currency: 'INR',
+              availability: Math.floor(Math.random() * 30) + 1
+            },
+            business: {
+              price: Math.floor(Math.random() * (35000 - 15000) + 15000),
+              currency: 'INR',
+              availability: Math.floor(Math.random() * 8) + 1
+            }
           }
-        });
-      }
+        }));
 
-      // Use fallback data
-      departuresResponse.data = fallbackResponse.data;
-    }
+        const routeFlights = allFlights.filter(flight => 
+          flight.to === toICAO || flight.to === to
+        );
 
-    // Format ALL flights departing from the origin airport
-    const allFlights = (departuresResponse.data || []).map(flight => ({
-      icao24: flight.icao24,
-      callsign: flight.callsign?.trim() || 'Unknown',
-      from: flight.estDepartureAirport || fromICAO,
-      to: flight.estArrivalAirport || 'Unknown',
-      departureTime: flight.firstSeen ? new Date(flight.firstSeen * 1000).toISOString() : null,
-      arrivalTime: flight.lastSeen ? new Date(flight.lastSeen * 1000).toISOString() : null,
-      duration: flight.firstSeen && flight.lastSeen ? 
-        Math.round((flight.lastSeen - flight.firstSeen) / 60) + ' minutes' : 'Unknown',
-      // Additional flight info
-      departureTimestamp: flight.firstSeen,
-      arrivalTimestamp: flight.lastSeen
-    }));
-
-    // Filter flights going to specific destination
-    const routeFlights = allFlights.filter(flight => {
-      const arrivalAirport = flight.to;
-      return arrivalAirport === toICAO || arrivalAirport === to;
-    });
-
-    // Group flights by destination for analysis
-    const destinationGroups = {};
-    allFlights.forEach(flight => {
-      const dest = flight.to;
-      if (!destinationGroups[dest]) {
-        destinationGroups[dest] = [];
-      }
-      destinationGroups[dest].push(flight);
-    });
-
-    // Sort destinations by flight count
-    const destinationSummary = Object.entries(destinationGroups)
-      .map(([dest, flights]) => ({
-        destination: dest,
-        flightCount: flights.length,
-        flights: flights.slice(0, 3) // Show first 3 flights per destination
-      }))
-      .sort((a, b) => b.flightCount - a.flightCount);
-
-    // Determine what to return based on showAll parameter
-    if (showAll === 'true' || routeFlights.length === 0) {
-      return res.json({
-        success: true,
-        route: `${from} → ALL DESTINATIONS`,
-        searchedRoute: `${from} → ${to}`,
-        routeFlightsFound: routeFlights.length,
-        totalFlightsFound: allFlights.length,
-        data: allFlights,
-        destinationSummary: destinationSummary,
-        message: routeFlights.length === 0 ? 
-          `No direct flights found from ${from} to ${to}. Showing all departures from ${from}.` :
-          `Showing all ${allFlights.length} departures from ${from}`,
-        meta: {
-          source: 'opensky-network',
-          searchHours: searchHours,
-          fromICAO: fromICAO,
-          toICAO: toICAO,
-          timestamp: new Date().toISOString()
+        if (routeFlights.length > 0) {
+          return res.json({
+            success: true,
+            route: `${from} → ${to}`,
+            count: routeFlights.length,
+            data: routeFlights,
+            meta: {
+              source: 'opensky-network',
+              searchHours: searchHours,
+              fromICAO: fromICAO,
+              toICAO: toICAO,
+              timestamp: new Date().toISOString()
+            }
+          });
         }
-      });
+      }
+    } catch (openskyError) {
+      console.error('OpenSky timeout or error:', openskyError.message);
     }
 
-    res.json({
-      success: true,
-      route: `${from} → ${to}`,
-      count: routeFlights.length,
-      data: routeFlights,
-      allFlightsFromOrigin: allFlights.length,
-      destinationSummary: destinationSummary.slice(0, 5), // Top 5 destinations
-      meta: {
-        source: 'opensky-network',
-        searchHours: searchHours,
-        fromICAO: fromICAO,
-        toICAO: toICAO,
-        totalFlightsFound: allFlights.length,
-        timestamp: new Date().toISOString()
-      }
-    });
-
-  } catch (err) {
-    console.error('OpenSky route search error:', {
-      message: err.message,
-      response: err.response?.data,
-      status: err.response?.status,
-      url: err.config?.url
-    });
-
-    // Provide mock data as fallback for demonstration
+    // Enhanced realistic mock data with pricing
     const mockFlights = [
       {
-        icao24: 'demo001',
-        callsign: 'AI127',
-        from: from,
-        to: to,
-        departureTime: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
-        arrivalTime: new Date(Date.now() - 0.5 * 3600 * 1000).toISOString(),
-        duration: '90 minutes'
+        flightNumber: 'AI127',
+        airline: {
+          name: 'Air India',
+          iata: 'AI',
+          icao: 'AIC'
+        },
+        from: {
+          airport: from === 'DEL' ? 'Indira Gandhi International Airport' : 'Chhatrapati Shivaji Maharaj International Airport',
+          iata: from,
+          scheduled: new Date(Date.now() + 2 * 3600 * 1000).toISOString(),
+          terminal: from === 'DEL' ? 'T3' : 'T2'
+        },
+        to: {
+          airport: to === 'BOM' ? 'Chhatrapati Shivaji Maharaj International Airport' : 'Indira Gandhi International Airport',
+          iata: to,
+          scheduled: new Date(Date.now() + 4.5 * 3600 * 1000).toISOString(),
+          terminal: to === 'BOM' ? 'T2' : 'T3'
+        },
+        status: 'scheduled',
+        duration: '2h 30m',
+        pricing: {
+          economy: {
+            price: 4500,
+            currency: 'INR',
+            availability: 23,
+            class: 'Economy'
+          },
+          premium: {
+            price: 8900,
+            currency: 'INR', 
+            availability: 12,
+            class: 'Premium Economy'
+          },
+          business: {
+            price: 18500,
+            currency: 'INR',
+            availability: 4,
+            class: 'Business'
+          }
+        }
       },
       {
-        icao24: 'demo002', 
-        callsign: 'SG8195',
-        from: from,
-        to: to,
-        departureTime: new Date(Date.now() - 5 * 3600 * 1000).toISOString(),
-        arrivalTime: new Date(Date.now() - 3.5 * 3600 * 1000).toISOString(),
-        duration: '90 minutes'
+        flightNumber: 'SG8195',
+        airline: {
+          name: 'SpiceJet',
+          iata: 'SG',
+          icao: 'SEJ'
+        },
+        from: {
+          airport: from === 'DEL' ? 'Indira Gandhi International Airport' : 'Chhatrapati Shivaji Maharaj International Airport',
+          iata: from,
+          scheduled: new Date(Date.now() + 5 * 3600 * 1000).toISOString(),
+          terminal: from === 'DEL' ? 'T1' : 'T1'
+        },
+        to: {
+          airport: to === 'BOM' ? 'Chhatrapati Shivaji Maharaj International Airport' : 'Indira Gandhi International Airport',
+          iata: to,
+          scheduled: new Date(Date.now() + 7.5 * 3600 * 1000).toISOString(),
+          terminal: to === 'BOM' ? 'T1' : 'T1'
+        },
+        status: 'scheduled',
+        duration: '2h 30m',
+        pricing: {
+          economy: {
+            price: 3200,
+            currency: 'INR',
+            availability: 45,
+            class: 'Economy'
+          },
+          business: {
+            price: 12800,
+            currency: 'INR',
+            availability: 8,
+            class: 'Business'
+          }
+        }
+      },
+      {
+        flightNumber: '6E2134',
+        airline: {
+          name: 'IndiGo',
+          iata: '6E',
+          icao: 'IGO'
+        },
+        from: {
+          airport: from === 'DEL' ? 'Indira Gandhi International Airport' : 'Chhatrapati Shivaji Maharaj International Airport',
+          iata: from,
+          scheduled: new Date(Date.now() + 8 * 3600 * 1000).toISOString(),
+          terminal: from === 'DEL' ? 'T1' : 'T1'
+        },
+        to: {
+          airport: to === 'BOM' ? 'Chhatrapati Shivaji Maharaj International Airport' : 'Indira Gandhi International Airport',
+          iata: to,
+          scheduled: new Date(Date.now() + 10.5 * 3600 * 1000).toISOString(),
+          terminal: to === 'BOM' ? 'T1' : 'T1'
+        },
+        status: 'scheduled',
+        duration: '2h 30m',
+        pricing: {
+          economy: {
+            price: 3800,
+            currency: 'INR',
+            availability: 38,
+            class: 'Economy'
+          },
+          business: {
+            price: 15200,
+            currency: 'INR',
+            availability: 6,
+            class: 'Business'
+          }
+        }
       }
     ];
 
@@ -358,15 +462,35 @@ exports.getFlightRoute = async (req, res) => {
       route: `${from} → ${to}`,
       count: mockFlights.length,
       data: mockFlights,
-      message: 'Using demo data - OpenSky API unavailable',
-      error: err.response?.data || err.message,
+      message: 'Showing realistic demo data with pricing - Live APIs unavailable',
       meta: {
-        source: 'demo-data',
+        source: 'enhanced-demo-data',
         searchHours: searchHours,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        note: 'Prices are indicative and may vary'
       }
     });
+
+  } catch (err) {
+    console.error('Flight route search error:', err.message);
+    res.status(500).json({ 
+      message: 'Error searching flight route', 
+      error: err.message 
+    });
   }
+};
+
+// Helper function to calculate flight duration
+exports.calculateDuration = (departure, arrival) => {
+  if (!departure || !arrival) return 'Unknown';
+  
+  const depTime = new Date(departure);
+  const arrTime = new Date(arrival);
+  const diffMs = arrTime - depTime;
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+  
+  return `${diffHours}h ${diffMins}m`;
 };
 
 // 4. Get all current flights (live tracking)
