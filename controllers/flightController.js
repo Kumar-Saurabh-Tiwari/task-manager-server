@@ -1,11 +1,11 @@
 const axios = require('axios');
 
-// You should store these in environment variables for security!
-const AMADEUS_API_KEY = process.env.AMADEUS_API_KEY || '9iNdAWz1A8GpBAvLsPnJGxpDCRmGwDYF';
-const AMADEUS_API_SECRET = process.env.AMADEUS_API_SECRET || 'AgLtrTzbg2OAosNK';
-const AMADEUS_BASE_URL = 'https://test.api.amadeus.com/v1';
+// Free API configurations
+const AVIATIONSTACK_API_KEY = process.env.AVIATIONSTACK_API_KEY || '5f231e2243ce635cd83ef0702547deed'; // Get from https://aviationstack.com/
+const AVIATIONSTACK_BASE_URL = 'http://api.aviationstack.com/v1';
+const OPENSKY_BASE_URL = 'https://opensky-network.org/api';
 
-// Static airport list (for demo; in production, use a DB or external API)
+// Static airport list (backup for demo)
 const airports = [
   { code: 'DEN', name: 'Denver International Airport', city: 'Denver', country: 'United States' },
   { code: 'JFK', name: 'John F. Kennedy International Airport', city: 'New York', country: 'United States' },
@@ -32,333 +32,382 @@ const airports = [
   { code: 'DEL', name: 'Indira Gandhi International Airport', city: 'Delhi', country: 'India' }
 ];
 
-// Get Amadeus access token
-async function getAccessToken() {
-  if (!AMADEUS_API_KEY || !AMADEUS_API_SECRET) {
-    throw new Error('Amadeus API credentials are not configured');
-  }
-
-  const url = `${AMADEUS_BASE_URL}/security/oauth2/token`;
-  const params = new URLSearchParams();
-  params.append('grant_type', 'client_credentials');
-  params.append('client_id', AMADEUS_API_KEY);
-  params.append('client_secret', AMADEUS_API_SECRET);
-
-  try {
-    const response = await axios.post(url, params, {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    });
-    console.log('Amadeus token obtained successfully');
-    return response.data.access_token;
-  } catch (err) {
-    console.error('Amadeus token error:', err.response?.data || err.message);
-    throw new Error('Failed to get Amadeus access token');
-  }
-}
-
-// Dynamic airport search using Amadeus API
+// 1. Airport Search using AviationStack API
 exports.searchAirports = async (req, res) => {
+  const { q } = req.query;
+  
+  if (!q || q.length < 2) {
+    return res.json([]);
+  }
+
+  // Fallback to static list if no API key
+  if (!AVIATIONSTACK_API_KEY || AVIATIONSTACK_API_KEY === '5f231e2243ce635cd83ef0702547deed') {
+    const filtered = airports.filter(airport => 
+      airport.name.toLowerCase().includes(q.toLowerCase()) ||
+      airport.city.toLowerCase().includes(q.toLowerCase()) ||
+      airport.code.toLowerCase().includes(q.toLowerCase())
+    );
+    return res.json(filtered.slice(0, 10));
+  }
+
   try {
-    const { q } = req.query;
-    
-    if (!q || q.length < 2) {
-      return res.json([]);
-    }
-
-    // If no API credentials, fall back to static list
-    if (!AMADEUS_API_KEY || !AMADEUS_API_SECRET) {
-      const filtered = airports.filter(airport =>
-        airport.name.toLowerCase().includes(q.toLowerCase()) ||
-        airport.code.toLowerCase().includes(q.toLowerCase()) ||
-        airport.city.toLowerCase().includes(q.toLowerCase()) ||
-        airport.country.toLowerCase().includes(q.toLowerCase())
-      ).slice(0, 10);
-      return res.json(filtered);
-    }
-
-    const token = await getAccessToken();
-    
-    const response = await axios.get(`${AMADEUS_BASE_URL}/reference-data/locations`, {
-      headers: { Authorization: `Bearer ${token}` },
+    const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/airports`, {
       params: {
-        keyword: q,
-        subType: 'AIRPORT,CITY',
-        'page[limit]': 10
+        access_key: AVIATIONSTACK_API_KEY,
+        search: q,
+        limit: 10
       }
     });
 
-    const airports = response.data.data.map(location => ({
-      code: location.iataCode,
-      name: location.name,
-      city: location.address?.cityName || '',
-      country: location.address?.countryName || '',
-      detailedName: location.detailedName
+    const airportResults = (response.data.data || []).map(airport => ({
+      code: airport.iata_code,
+      name: airport.airport_name,
+      city: airport.city,
+      country: airport.country_name,
+      timezone: airport.timezone,
+      latitude: airport.latitude,
+      longitude: airport.longitude
     }));
 
-    res.json(airports);
+    res.json(airportResults);
   } catch (err) {
-    console.error('Error searching airports:', err.response?.data || err.message);
+    console.error('AviationStack airport search error:', err.response?.data || err.message);
     
-    // Fall back to static search if API fails
-    const { q } = req.query;
-    const filtered = airports.filter(airport =>
+    // Fallback to static list on error
+    const filtered = airports.filter(airport => 
       airport.name.toLowerCase().includes(q.toLowerCase()) ||
-      airport.code.toLowerCase().includes(q.toLowerCase()) ||
       airport.city.toLowerCase().includes(q.toLowerCase()) ||
-      airport.country.toLowerCase().includes(q.toLowerCase())
-    ).slice(0, 10);
+      airport.code.toLowerCase().includes(q.toLowerCase())
+    );
     
-    res.json(filtered);
+    res.json(filtered.slice(0, 10));
   }
 };
 
-// Flight search endpoint
+// 2. Flight Search using OpenSky Network API
 exports.searchFlights = async (req, res) => {
+  const {
+    origin,      // IATA code (e.g., 'DEL')
+    destination, // IATA code (e.g., 'BOM') - optional
+    direction,   // 'departure' or 'arrival'
+    hours        // How many hours back to search (default: 6)
+  } = req.query;
+
+  if (!origin) {
+    return res.status(400).json({ 
+      message: 'Missing required parameter: origin (airport IATA code)' 
+    });
+  }
+
+  const flightDirection = direction === 'arrival' ? 'arrival' : 'departure';
+  const searchHours = parseInt(hours) || 6;
+  
+  // Calculate time range (OpenSky uses UNIX timestamps)
+  const now = Math.floor(Date.now() / 1000);
+  const startTime = now - (searchHours * 3600); // X hours ago
+
   try {
-    const {
-      originLocationCode,
-      destinationLocationCode,
-      departureDate,
-      returnDate,
-      adults,
-      children,
-      travelClass,
-      max
-    } = req.body;
+    const url = `${OPENSKY_BASE_URL}/flights/${flightDirection}`;
+    const response = await axios.get(url, {
+      params: {
+        airport: origin,
+        begin: startTime,
+        end: now
+      }
+    });
 
-    // Validate required parameters
-    if (!originLocationCode || !destinationLocationCode || !departureDate || !adults) {
-      return res.status(400).json({ 
-        message: 'Missing required parameters', 
-        required: ['originLocationCode', 'destinationLocationCode', 'departureDate', 'adults'] 
-      });
+    let flights = response.data || [];
+
+    // Filter by destination if provided
+    if (destination) {
+      if (flightDirection === 'departure') {
+        flights = flights.filter(flight => flight.estArrivalAirport === destination);
+      } else {
+        flights = flights.filter(flight => flight.estDepartureAirport === destination);
+      }
     }
 
-    if (!AMADEUS_API_KEY || !AMADEUS_API_SECRET) {
-      return res.status(500).json({ 
-        message: 'Amadeus API credentials are not configured' 
-      });
-    }
+    // Format the response
+    const formattedFlights = flights.map(flight => ({
+      icao24: flight.icao24,
+      callsign: flight.callsign?.trim(),
+      departureAirport: flight.estDepartureAirport,
+      arrivalAirport: flight.estArrivalAirport,
+      departureTime: flight.firstSeen ? new Date(flight.firstSeen * 1000).toISOString() : null,
+      arrivalTime: flight.lastSeen ? new Date(flight.lastSeen * 1000).toISOString() : null,
+      estDepartureTime: flight.estDepartureAirportHorizDistance,
+      estArrivalTime: flight.estArrivalAirportHorizDistance
+    }));
 
-    const token = await getAccessToken();
-    console.log('Using token for flight search');
+    res.json({
+      success: true,
+      count: formattedFlights.length,
+      data: formattedFlights,
+      meta: {
+        source: 'opensky-network',
+        airport: origin,
+        destination: destination || 'any',
+        direction: flightDirection,
+        searchHours: searchHours,
+        timestamp: new Date().toISOString()
+      }
+    });
 
-    const params = {
-      originLocationCode,
-      destinationLocationCode,
-      departureDate,
-      adults: parseInt(adults),
-      travelClass: travelClass || 'ECONOMY',
-      currencyCode: 'USD',
-      max: max || 10
+  } catch (err) {
+    console.error('OpenSky flight search error:', err.response?.data || err.message);
+    res.status(500).json({ 
+      message: 'Error searching flights', 
+      error: err.response?.data || err.message,
+      source: 'opensky-network'
+    });
+  }
+};
+
+// 3. Get flight route between two airports (DEL to BOM example)
+exports.getFlightRoute = async (req, res) => {
+  const { from, to, hours = 12, showAll = false } = req.query;
+
+  if (!from || !to) {
+    return res.status(400).json({ 
+      message: 'Missing required parameters: from and to (airport IATA codes)' 
+    });
+  }
+
+  const searchHours = parseInt(hours);
+  const now = Math.floor(Date.now() / 1000);
+  const startTime = now - (searchHours * 3600);
+
+  try {
+    // Convert IATA to ICAO if needed (OpenSky uses ICAO codes)
+    const iataToIcaoMap = {
+      'DEL': 'VIDP', 'BOM': 'VABB', 'JFK': 'KJFK', 'LAX': 'KLAX', 
+      'LHR': 'EGLL', 'CDG': 'LFPG', 'DXB': 'OMDB', 'SIN': 'WSSS',
+      'HKG': 'VHHH', 'NRT': 'RJAA', 'FRA': 'EDDF', 'AMS': 'EHAM'
     };
 
-    if (returnDate) params.returnDate = returnDate;
-    if (children) params.children = parseInt(children);
+    const fromICAO = iataToIcaoMap[from] || from;
+    const toICAO = iataToIcaoMap[to] || to;
 
-    console.log('Flight search params:', params);
+    // Get departures from origin airport
+    const departuresResponse = await axios.get(`${OPENSKY_BASE_URL}/flights/departure`, {
+      params: {
+        airport: fromICAO,
+        begin: startTime,
+        end: now
+      },
+      timeout: 10000 // 10 second timeout
+    });
 
-    try {
-      const response = await axios.get(`${AMADEUS_BASE_URL}/shopping/flight-offers`, {
-        headers: { 
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
+    console.log('OpenSky API Response:', {
+      status: departuresResponse.status,
+      dataLength: departuresResponse.data ? departuresResponse.data.length : 0,
+      data: departuresResponse.data
+    });
+
+    // Check if we got valid data
+    if (!departuresResponse.data || departuresResponse.data.length === 0) {
+      // Fallback: Try with different time ranges
+      const yesterday = now - (24 * 3600);
+      const fallbackResponse = await axios.get(`${OPENSKY_BASE_URL}/flights/departure`, {
+        params: {
+          airport: fromICAO,
+          begin: yesterday,
+          end: now
         },
-        params
+        timeout: 10000
       });
 
-      console.log('Flight search successful, found', response.data.data?.length || 0, 'flights');
-      
-      const flightOffers = response.data.data || [];
-      
-      // Format the response for easier frontend consumption
-      const formattedFlights = flightOffers.map(offer => ({
-        id: offer.id,
-        price: {
-          currency: offer.price.currency,
-          total: offer.price.total,
-          base: offer.price.base
-        },
-        itineraries: offer.itineraries.map(itinerary => ({
-          duration: itinerary.duration,
-          segments: itinerary.segments.map(segment => ({
-            departure: {
-              iataCode: segment.departure.iataCode,
-              terminal: segment.departure.terminal,
-              at: segment.departure.at
-            },
-            arrival: {
-              iataCode: segment.arrival.iataCode,
-              terminal: segment.arrival.terminal,
-              at: segment.arrival.at
-            },
-            carrierCode: segment.carrierCode,
-            number: segment.number,
-            aircraft: segment.aircraft,
-            duration: segment.duration
-          }))
-        })),
-        validatingAirlineCodes: offer.validatingAirlineCodes,
-        travelerPricings: offer.travelerPricings
-      }));
-
-      res.json({
-        success: true,
-        data: formattedFlights,
-        meta: {
-          count: formattedFlights.length,
-          source: 'amadeus_api'
-        }
-      });
-
-    } catch (apiError) {
-      // If Amadeus API fails due to product limitations, return mock data
-      if (apiError.response?.status === 401 && 
-          apiError.response?.data?.fault?.detail?.errorcode?.includes('InvalidAPICallAsNoApiProductMatchFound')) {
-        
-        console.log('Amadeus API product limitation detected, returning mock data');
-        
-        // Generate mock flight data
-        const mockFlights = generateMockFlights(originLocationCode, destinationLocationCode, departureDate, returnDate, adults);
-        
+      if (!fallbackResponse.data || fallbackResponse.data.length === 0) {
         return res.json({
           success: true,
-          data: mockFlights,
+          route: `${from} → ${to}`,
+          count: 0,
+          data: [],
+          message: 'No flight data available for this route in the specified time range',
+          suggestions: [
+            'Try increasing the hours parameter (e.g., hours=24 or hours=48)',
+            'This route might not have regular flights',
+            'OpenSky Network has limited historical data'
+          ],
           meta: {
-            count: mockFlights.length,
-            source: 'mock_data',
-            message: 'Real-time data unavailable. Showing sample flights.'
+            source: 'opensky-network',
+            searchHours: searchHours,
+            fromICAO: fromICAO,
+            toICAO: toICAO,
+            timestamp: new Date().toISOString()
           }
         });
       }
-      
-      // Re-throw other API errors
-      throw apiError;
+
+      // Use fallback data
+      departuresResponse.data = fallbackResponse.data;
     }
+
+    // Format ALL flights departing from the origin airport
+    const allFlights = (departuresResponse.data || []).map(flight => ({
+      icao24: flight.icao24,
+      callsign: flight.callsign?.trim() || 'Unknown',
+      from: flight.estDepartureAirport || fromICAO,
+      to: flight.estArrivalAirport || 'Unknown',
+      departureTime: flight.firstSeen ? new Date(flight.firstSeen * 1000).toISOString() : null,
+      arrivalTime: flight.lastSeen ? new Date(flight.lastSeen * 1000).toISOString() : null,
+      duration: flight.firstSeen && flight.lastSeen ? 
+        Math.round((flight.lastSeen - flight.firstSeen) / 60) + ' minutes' : 'Unknown',
+      // Additional flight info
+      departureTimestamp: flight.firstSeen,
+      arrivalTimestamp: flight.lastSeen
+    }));
+
+    // Filter flights going to specific destination
+    const routeFlights = allFlights.filter(flight => {
+      const arrivalAirport = flight.to;
+      return arrivalAirport === toICAO || arrivalAirport === to;
+    });
+
+    // Group flights by destination for analysis
+    const destinationGroups = {};
+    allFlights.forEach(flight => {
+      const dest = flight.to;
+      if (!destinationGroups[dest]) {
+        destinationGroups[dest] = [];
+      }
+      destinationGroups[dest].push(flight);
+    });
+
+    // Sort destinations by flight count
+    const destinationSummary = Object.entries(destinationGroups)
+      .map(([dest, flights]) => ({
+        destination: dest,
+        flightCount: flights.length,
+        flights: flights.slice(0, 3) // Show first 3 flights per destination
+      }))
+      .sort((a, b) => b.flightCount - a.flightCount);
+
+    // Determine what to return based on showAll parameter
+    if (showAll === 'true' || routeFlights.length === 0) {
+      return res.json({
+        success: true,
+        route: `${from} → ALL DESTINATIONS`,
+        searchedRoute: `${from} → ${to}`,
+        routeFlightsFound: routeFlights.length,
+        totalFlightsFound: allFlights.length,
+        data: allFlights,
+        destinationSummary: destinationSummary,
+        message: routeFlights.length === 0 ? 
+          `No direct flights found from ${from} to ${to}. Showing all departures from ${from}.` :
+          `Showing all ${allFlights.length} departures from ${from}`,
+        meta: {
+          source: 'opensky-network',
+          searchHours: searchHours,
+          fromICAO: fromICAO,
+          toICAO: toICAO,
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      route: `${from} → ${to}`,
+      count: routeFlights.length,
+      data: routeFlights,
+      allFlightsFromOrigin: allFlights.length,
+      destinationSummary: destinationSummary.slice(0, 5), // Top 5 destinations
+      meta: {
+        source: 'opensky-network',
+        searchHours: searchHours,
+        fromICAO: fromICAO,
+        toICAO: toICAO,
+        totalFlightsFound: allFlights.length,
+        timestamp: new Date().toISOString()
+      }
+    });
 
   } catch (err) {
-    console.error('Error searching flights:', err.response?.data || err.message);
-    
-    if (err.response?.status === 401) {
-      return res.status(401).json({ 
-        message: 'Amadeus API authentication failed', 
-        error: 'Invalid credentials or expired token' 
-      });
-    }
-    
-    if (err.response?.status === 400) {
-      return res.status(400).json({ 
-        message: 'Invalid flight search parameters', 
-        error: err.response.data 
-      });
-    }
+    console.error('OpenSky route search error:', {
+      message: err.message,
+      response: err.response?.data,
+      status: err.response?.status,
+      url: err.config?.url
+    });
 
+    // Provide mock data as fallback for demonstration
+    const mockFlights = [
+      {
+        icao24: 'demo001',
+        callsign: 'AI127',
+        from: from,
+        to: to,
+        departureTime: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+        arrivalTime: new Date(Date.now() - 0.5 * 3600 * 1000).toISOString(),
+        duration: '90 minutes'
+      },
+      {
+        icao24: 'demo002', 
+        callsign: 'SG8195',
+        from: from,
+        to: to,
+        departureTime: new Date(Date.now() - 5 * 3600 * 1000).toISOString(),
+        arrivalTime: new Date(Date.now() - 3.5 * 3600 * 1000).toISOString(),
+        duration: '90 minutes'
+      }
+    ];
+
+    res.json({
+      success: true,
+      route: `${from} → ${to}`,
+      count: mockFlights.length,
+      data: mockFlights,
+      message: 'Using demo data - OpenSky API unavailable',
+      error: err.response?.data || err.message,
+      meta: {
+        source: 'demo-data',
+        searchHours: searchHours,
+        timestamp: new Date().toISOString()
+      }
+    });
+  }
+};
+
+// 4. Get all current flights (live tracking)
+exports.getCurrentFlights = async (req, res) => {
+  try {
+    const response = await axios.get(`${OPENSKY_BASE_URL}/states/all`);
+    
+    const flights = (response.data.states || []).map(state => ({
+      icao24: state[0],
+      callsign: state[1]?.trim(),
+      originCountry: state[2],
+      timePosition: state[3] ? new Date(state[3] * 1000).toISOString() : null,
+      lastContact: state[4] ? new Date(state[4] * 1000).toISOString() : null,
+      longitude: state[5],
+      latitude: state[6],
+      baroAltitude: state[7],
+      onGround: state[8],
+      velocity: state[9],
+      trueTrack: state[10],
+      verticalRate: state[11],
+      geoAltitude: state[13],
+      squawk: state[14],
+      spi: state[15],
+      positionSource: state[16]
+    }));
+
+    res.json({
+      success: true,
+      count: flights.length,
+      data: flights.slice(0, 100), // Limit to first 100 for performance
+      meta: {
+        source: 'opensky-network',
+        timestamp: new Date().toISOString()
+      }
+    });
+
+  } catch (err) {
+    console.error('OpenSky current flights error:', err.response?.data || err.message);
     res.status(500).json({ 
-      message: 'Error searching flights', 
+      message: 'Error fetching current flights', 
       error: err.response?.data || err.message 
     });
   }
 };
-
-// Generate mock flight data for demo purposes
-function generateMockFlights(origin, destination, departureDate, returnDate, adults) {
-  const airlines = [
-    { code: 'UA', name: 'United Airlines' },
-    { code: 'AA', name: 'American Airlines' },
-    { code: 'DL', name: 'Delta Air Lines' },
-    { code: 'B6', name: 'JetBlue Airways' },
-    { code: 'AS', name: 'Alaska Airlines' }
-  ];
-
-  const mockFlights = [];
-  
-  for (let i = 0; i < 5; i++) {
-    const airline = airlines[i % airlines.length];
-    const basePrice = 200 + (i * 50) + Math.floor(Math.random() * 100);
-    const departureTime = new Date(departureDate);
-    departureTime.setHours(6 + (i * 3), Math.floor(Math.random() * 60));
-    
-    const arrivalTime = new Date(departureTime);
-    arrivalTime.setHours(arrivalTime.getHours() + 4 + Math.floor(Math.random() * 3));
-
-    const flight = {
-      id: `mock_${i + 1}`,
-      price: {
-        currency: 'USD',
-        total: basePrice.toString(),
-        base: (basePrice - 50).toString()
-      },
-      itineraries: [
-        {
-          duration: `PT${4 + i}H${30 + (i * 10)}M`,
-          segments: [
-            {
-              departure: {
-                iataCode: origin,
-                terminal: Math.random() > 0.5 ? '1' : '2',
-                at: departureTime.toISOString()
-              },
-              arrival: {
-                iataCode: destination,
-                terminal: Math.random() > 0.5 ? '4' : '5',
-                at: arrivalTime.toISOString()
-              },
-              carrierCode: airline.code,
-              number: `${airline.code}${1000 + i}`,
-              aircraft: { code: '320' },
-              duration: `PT${4 + i}H${30 + (i * 10)}M`
-            }
-          ]
-        }
-      ],
-      validatingAirlineCodes: [airline.code],
-      travelerPricings: [
-        {
-          travelerId: '1',
-          fareOption: 'STANDARD',
-          travelerType: 'ADULT',
-          price: {
-            currency: 'USD',
-            total: basePrice.toString(),
-            base: (basePrice - 50).toString()
-          }
-        }
-      ]
-    };
-
-    // Add return flight if returnDate is provided
-    if (returnDate) {
-      const returnDepartureTime = new Date(returnDate);
-      returnDepartureTime.setHours(8 + (i * 2), Math.floor(Math.random() * 60));
-      
-      const returnArrivalTime = new Date(returnDepartureTime);
-      returnArrivalTime.setHours(returnArrivalTime.getHours() + 4 + Math.floor(Math.random() * 3));
-
-      flight.itineraries.push({
-        duration: `PT${4 + i}H${30 + (i * 10)}M`,
-        segments: [
-          {
-            departure: {
-              iataCode: destination,
-              terminal: Math.random() > 0.5 ? '4' : '5',
-              at: returnDepartureTime.toISOString()
-            },
-            arrival: {
-              iataCode: origin,
-              terminal: Math.random() > 0.5 ? '1' : '2',
-              at: returnArrivalTime.toISOString()
-            },
-            carrierCode: airline.code,
-            number: `${airline.code}${2000 + i}`,
-            aircraft: { code: '320' },
-            duration: `PT${4 + i}H${30 + (i * 10)}M`
-          }
-        ]
-      });
-    }
-
-    mockFlights.push(flight);
-  }
-
-  return mockFlights;
-}

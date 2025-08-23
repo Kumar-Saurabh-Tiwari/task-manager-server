@@ -6,6 +6,10 @@ const flightController = require('../controllers/flightController');
 router.get('/airports', flightController.searchAirports);
 
 // Flight search
-router.post('/search', flightController.searchFlights);
+router.get('/search', flightController.searchFlights);
+
+
+// Flight search
+router.get('/get-route', flightController.getFlightRoute);
 
 module.exports = router;
